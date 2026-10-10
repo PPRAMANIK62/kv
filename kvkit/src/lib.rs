@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    fs::{File, OpenOptions, create_dir_all},
+    fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Error, ErrorKind, Result, Seek, SeekFrom, Write},
     path::Path,
 };
@@ -112,23 +112,20 @@ pub struct Store {
 }
 
 impl Store {
-    /// Opens the file and starts with an empty index.
+    /// Opens the store in directory `dir`, creating the directory and
+    /// an empty log if the don't exist, and rebuilds the index from the log.
     pub fn open(dir: impl AsRef<Path>) -> Result<Store> {
         let dir = dir.as_ref();
-        create_dir_all(dir)?;
+        fs::create_dir_all(dir)?;
 
-        let file = OpenOptions::new()
+        let mut file = OpenOptions::new()
             .read(true)
             .append(true)
             .create(true)
             .open(dir.join(LOG_FILE))?;
-        let end = file.metadata()?.len();
+        let (index, end) = replay(&mut file)?;
 
-        Ok(Store {
-            file,
-            index: HashMap::new(), // empty
-            end,
-        })
+        Ok(Store { file, index, end })
     }
 
     /// Sets `key` to `value`, replacing any earlier value.
@@ -191,11 +188,39 @@ impl Store {
     }
 }
 
+/// Reads the whole log from the start and returns the index it describes,
+/// along with the log's length.
+fn replay(file: &mut File) -> Result<(HashMap<Vec<u8>, u64>, u64)> {
+    let mut index = HashMap::new();
+    let mut reader = BufReader::new(file);
+    let mut offset = 0;
+
+    loop {
+        let (record, len) = match read_record(&mut reader) {
+            Ok(Some(found)) => found,
+            Ok(None) => break,
+            Err(e) => {
+                let message = format!("bad record at offset {offset}: {e}");
+                return Err(Error::new(e.kind(), message));
+            }
+        };
+        match record {
+            Record::Set { key, .. } => {
+                index.insert(key, offset);
+            }
+            Record::Delete { key } => {
+                index.remove(&key);
+            }
+        }
+        offset += len;
+    }
+
+    Ok((index, offset))
+}
+
 /// A fresh, empty directory for one test, under the system's temp dir.
 #[cfg(test)]
 fn test_dir(name: &str) -> std::path::PathBuf {
-    use std::fs;
-
     let dir = std::env::temp_dir().join(format!("kvkit-{}-{name}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
     dir
@@ -203,8 +228,6 @@ fn test_dir(name: &str) -> std::path::PathBuf {
 
 #[cfg(test)]
 mod store_tests {
-    use std::fs;
-
     use super::*;
 
     #[test]
@@ -266,6 +289,67 @@ mod store_tests {
             (b"cherry".to_vec(), b"dark red".to_vec()),
         ];
         assert_eq!(store.scan_all().unwrap(), expected);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod reopen_tests {
+    use super::*;
+
+    #[test]
+    fn reopen_rebuilds_the_index() {
+        let dir = test_dir("reopen");
+        let mut store = Store::open(&dir).unwrap();
+        store.set(b"apple", b"red").unwrap();
+        store.set(b"banana", b"yellow").unwrap();
+        store.set(b"apple", b"green").unwrap();
+        store.delete(b"banana").unwrap();
+        drop(store);
+
+        let mut store = Store::open(&dir).unwrap();
+        assert_eq!(store.get(b"apple").unwrap(), Some(b"green".to_vec()));
+        assert_eq!(store.get(b"banana").unwrap(), None);
+        // New writes go after the old records, not over them.
+        store.set(b"cherry", b"dark red").unwrap();
+        drop(store);
+
+        let mut store = Store::open(&dir).unwrap();
+        assert_eq!(store.get(b"apple").unwrap(), Some(b"green".to_vec()));
+        assert_eq!(store.get(b"cherry").unwrap(), Some(b"dark red".to_vec()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn writes_go_to_the_end_after_a_read() {
+        let dir = test_dir("append_after_read");
+        let mut store = Store::open(&dir).unwrap();
+        // A value bigger than BufReader's 8 KiB buffer, so that reading it
+        // leaves the file's cursor in the middle of the log.
+        let big = vec![b'x'; 20_000];
+        store.set(b"big", &big).unwrap();
+        store.set(b"small", b"1").unwrap();
+        assert_eq!(store.get(b"big").unwrap(), Some(big.clone()));
+        store.set(b"after", b"2").unwrap();
+        drop(store);
+
+        let mut store = Store::open(&dir).unwrap();
+        assert_eq!(store.get(b"big").unwrap(), Some(big));
+        assert_eq!(store.get(b"small").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(store.get(b"after").unwrap(), Some(b"2".to_vec()));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_write_survives_without_closing_the_store() {
+        let dir = test_dir("no_close");
+        let mut store = Store::open(&dir).unwrap();
+        store.set(b"apple", b"red").unwrap();
+        // Skip Store's destructor, as a process killed with SIGKILL would.
+        std::mem::forget(store);
+
+        let mut store = Store::open(&dir).unwrap();
+        assert_eq!(store.get(b"apple").unwrap(), Some(b"red".to_vec()));
         fs::remove_dir_all(&dir).unwrap();
     }
 }
