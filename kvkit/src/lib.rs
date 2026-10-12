@@ -353,3 +353,38 @@ mod reopen_tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 }
+
+#[cfg(test)]
+mod damage_tests {
+    use std::io;
+
+    use super::*;
+
+    /// Writes `log` as the log file of a fresh store directory.
+    fn dir_with_log(name: &str, log: &[u8]) -> std::path::PathBuf {
+        let dir = test_dir(name);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(LOG_FILE), log).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_torn_last_record_stops_open() {
+        // The second record lost its last 3 bytes.
+        let dir = dir_with_log("torn", b"S 3 6\nfig\npurple\nS 3 3\nfi");
+        let err = Store::open(&dir).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert!(err.to_string().contains("offset 17"), "{err}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_damaged_header_stops_open() {
+        // "S" became "T".
+        let dir = dir_with_log("bad_header", b"S 3 6\nfig\npurple\nT 3 3\nfig\nred\n");
+        let err = Store::open(&dir).err().unwrap();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("offset 17"), "{err}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+}
