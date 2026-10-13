@@ -2,8 +2,12 @@
 
 pub mod checksum;
 pub mod codec;
+mod error;
+mod record;
 mod store;
 
+pub use error::{KvError, Result};
+pub use record::{MAX_KEY_LEN, MAX_VALUE_LEN};
 pub use store::Store;
 
 /// `len` bytes that look random but are the same for the same `seed`, for tests.
