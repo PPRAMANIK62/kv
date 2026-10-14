@@ -1,105 +1,17 @@
 use std::{
     collections::HashMap,
     fs::{self, File, OpenOptions},
-    io::{BufRead, BufReader, Error, ErrorKind, Result, Seek, SeekFrom, Write},
+    io::{BufReader, Seek, SeekFrom, Write},
     path::Path,
+};
+
+use crate::{
+    KvError, Result,
+    record::{Record, read_record},
 };
 
 /// The name of the llog file inside a store's directory.
 const LOG_FILE: &str = "data.log";
-
-/// One entry in the log.
-#[derive(Debug, Clone, PartialEq)]
-enum Record {
-    Set { key: Vec<u8>, value: Vec<u8> },
-    Delete { key: Vec<u8> },
-}
-
-impl Record {
-    /// The record's bytes, exactly as they go into the log:
-    /// `S <key len> <vallue len>\n<key>\n<value>\n` or
-    /// `D <key len>\n<key>\n`.
-    fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::new();
-        match self {
-            Record::Set { key, value } => {
-                let header = format!("S {} {}\n", key.len(), value.len());
-                out.extend_from_slice(header.as_bytes());
-                out.extend_from_slice(key);
-                out.push(b'\n');
-                out.extend_from_slice(value);
-                out.push(b'\n');
-            }
-            Record::Delete { key } => {
-                let header = format!("D {}\n", key.len());
-                out.extend_from_slice(header.as_bytes());
-                out.extend_from_slice(key);
-                out.push(b'\n');
-            }
-        }
-        out
-    }
-}
-
-/// Reads the next record from `reader`. Returns `Ok(None)` at the end of the log,
-/// and otherwise the record and it's length in bytes.
-fn read_record(reader: &mut impl BufRead) -> Result<Option<(Record, u64)>> {
-    let mut header = Vec::new();
-
-    reader.read_until(b'\n', &mut header)?;
-    if header.is_empty() {
-        return Ok(None); // a clean end: no bytes left at all
-    }
-
-    let mut len = header.len() as u64;
-    if header.pop() != Some(b'\n') {
-        return Err(corrupt("the log ends inside a record header"));
-    }
-
-    let Ok(header_text) = str::from_utf8(&header) else {
-        return Err(corrupt("the record header is not text"));
-    };
-
-    let fields: Vec<&str> = header_text.split(' ').collect();
-    let record = match fields.as_slice() {
-        ["S", key_len, value_len] => {
-            let key = read_field(reader, parse_len(key_len)?)?;
-            let value = read_field(reader, parse_len(value_len)?)?;
-
-            len += key.len() as u64 + 1 + value.len() as u64 + 1;
-            Record::Set { key, value }
-        }
-        ["D", key_len] => {
-            let key = read_field(reader, parse_len(key_len)?)?;
-
-            len += key.len() as u64 + 1;
-            Record::Delete { key }
-        }
-        _ => return Err(corrupt("unknown record header")),
-    };
-
-    Ok(Some((record, len)))
-}
-
-/// Reads `len` bytes followed by the newline that ends every field.
-fn read_field(reader: &mut impl BufRead, len: usize) -> Result<Vec<u8>> {
-    let mut field = vec![0; len + 1];
-    reader.read_exact(&mut field)?;
-    if field.pop() != Some(b'\n') {
-        return Err(corrupt("a field is not followed by a newline"));
-    }
-    Ok(field)
-}
-
-fn parse_len(text: &str) -> Result<usize> {
-    text.parse()
-        .map_err(|_| corrupt("a length in a record header is not a number"))
-}
-
-/// The error for bytes in the log that don't form a valid record.
-fn corrupt(message: &str) -> Error {
-    Error::new(ErrorKind::InvalidData, message)
-}
 
 /// A key-value store kept in a single append-only log file.
 pub struct Store {
@@ -117,14 +29,13 @@ impl Store {
     pub fn open(dir: impl AsRef<Path>) -> Result<Store> {
         let dir = dir.as_ref();
         fs::create_dir_all(dir)?;
-
         let mut file = OpenOptions::new()
             .read(true)
             .append(true)
             .create(true)
             .open(dir.join(LOG_FILE))?;
-        let (index, end) = replay(&mut file)?;
-
+        let end = file.metadata()?.len();
+        let index = replay(&mut file, end)?;
         Ok(Store { file, index, end })
     }
 
@@ -151,7 +62,7 @@ impl Store {
 
     /// Writes `record` at the end of the log and returns it's offset.
     fn append(&mut self, record: &Record) -> Result<u64> {
-        let bytes = record.encode();
+        let bytes = record.encode()?;
         self.file.write_all(&bytes)?;
         let offset = self.end;
         self.end += bytes.len() as u64;
@@ -164,10 +75,12 @@ impl Store {
             return Ok(None);
         };
         self.file.seek(SeekFrom::Start(offset))?;
-        let mut reader = BufReader::new(&mut self.file);
-        match read_record(&mut reader)? {
-            Some((Record::Set { key: found, value }, _)) if found == key => Ok(Some(value)),
-            _ => Err(corrupt("the index points at the wrong record")),
+        match read_record(&mut self.file, offset, self.end)? {
+            (Record::Set { key: found, value }, _) if found == key => Ok(Some(value)),
+            _ => {
+                let reason = "the index points at the wrong record";
+                Err(KvError::Corrupt { offset, reason })
+            }
         }
     }
 
@@ -190,20 +103,12 @@ impl Store {
 
 /// Reads the whole log from the start and returns the index it describes,
 /// along with the log's length.
-fn replay(file: &mut File) -> Result<(HashMap<Vec<u8>, u64>, u64)> {
+fn replay(file: &mut File, end: u64) -> Result<HashMap<Vec<u8>, u64>> {
     let mut index = HashMap::new();
     let mut reader = BufReader::new(file);
     let mut offset = 0;
-
-    loop {
-        let (record, len) = match read_record(&mut reader) {
-            Ok(Some(found)) => found,
-            Ok(None) => break,
-            Err(e) => {
-                let message = format!("bad record at offset {offset}: {e}");
-                return Err(Error::new(e.kind(), message));
-            }
-        };
+    while offset < end {
+        let (record, len) = read_record(&mut reader, offset, end)?;
         match record {
             Record::Set { key, .. } => {
                 index.insert(key, offset);
@@ -214,8 +119,7 @@ fn replay(file: &mut File) -> Result<(HashMap<Vec<u8>, u64>, u64)> {
         }
         offset += len;
     }
-
-    Ok((index, offset))
+    Ok(index)
 }
 
 /// A fresh, empty directory for one test, under the system's temp dir.
@@ -356,14 +260,20 @@ mod reopen_tests {
 
 #[cfg(test)]
 mod damage_tests {
-    use std::io;
+    use crate::KvError;
 
     use super::*;
 
-    /// Writes `log` as the log file of a fresh store directory.
-    fn dir_with_log(name: &str, log: &[u8]) -> std::path::PathBuf {
+    /// A store directory whose log holds `set fig purple` (19 bytes) and
+    /// `set fig red` (16 bytes), then has `damage` done to it.
+    fn damaged_store(name: &str, damage: impl FnOnce(&mut Vec<u8>)) -> std::path::PathBuf {
         let dir = test_dir(name);
-        fs::create_dir_all(&dir).unwrap();
+        let mut store = Store::open(&dir).unwrap();
+        store.set(b"fig", b"purple").unwrap();
+        store.set(b"fig", b"red").unwrap();
+        drop(store);
+        let mut log = fs::read(dir.join(LOG_FILE)).unwrap();
+        damage(&mut log);
         fs::write(dir.join(LOG_FILE), log).unwrap();
         dir
     }
@@ -371,20 +281,83 @@ mod damage_tests {
     #[test]
     fn a_torn_last_record_stops_open() {
         // The second record lost its last 3 bytes.
-        let dir = dir_with_log("torn", b"S 3 6\nfig\npurple\nS 3 3\nfi");
+        let dir = damaged_store("torn", |log| log.truncate(log.len() - 3));
         let err = Store::open(&dir).err().unwrap();
-        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
-        assert!(err.to_string().contains("offset 17"), "{err}");
+        assert!(matches!(err, KvError::Truncated { offset: 19 }), "{err}");
         fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn a_damaged_header_stops_open() {
-        // "S" became "T".
-        let dir = dir_with_log("bad_header", b"S 3 6\nfig\npurple\nT 3 3\nfig\nred\n");
+    fn a_damaged_kind_stops_open() {
+        // The second record's kind, at 19 + 8, became 2: a delete.
+        let dir = damaged_store("bad_kind", |log| log[27] = 2);
         let err = Store::open(&dir).err().unwrap();
-        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-        assert!(err.to_string().contains("offset 17"), "{err}");
+        assert!(matches!(err, KvError::Corrupt { offset: 19, .. }), "{err}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_flipped_bit_in_a_value_stops_open() {
+        // "red" is the last 3 bytes. Flip the lowest bit of its "d".
+        let dir = damaged_store("flipped_bit", |log| *log.last_mut().unwrap() ^= 1);
+        let err = Store::open(&dir).err().unwrap();
+        assert!(matches!(err, KvError::Corrupt { offset: 19, .. }), "{err}");
+        assert!(err.to_string().ends_with("checksum mismatch"), "{err}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_huge_length_is_an_error_not_an_allocation() {
+        // The first record's body length, at bytes 4..8, became 4 GiB - 1.
+        let dir = damaged_store("huge_len", |log| log[4..8].fill(0xff));
+        let err = Store::open(&dir).err().unwrap();
+        assert!(matches!(err, KvError::Corrupt { offset: 0, .. }), "{err}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_length_past_the_end_is_truncated() {
+        // The second record's body length, at 19 + 4, grew by 100 bytes.
+        let dir = damaged_store("long_len", |log| log[23] += 100);
+        let err = Store::open(&dir).err().unwrap();
+        assert!(matches!(err, KvError::Truncated { offset: 19 }), "{err}");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod format_tests {
+    use super::*;
+
+    #[test]
+    fn records_land_at_the_expected_offsets() {
+        let dir = test_dir("offsets");
+        let mut store = Store::open(&dir).unwrap();
+        store.set(b"apple", b"red").unwrap();
+        store.set(b"fig", b"purple").unwrap();
+        store.delete(b"apple").unwrap();
+
+        let log = fs::read(dir.join(LOG_FILE)).unwrap();
+        let apple_red = Record::Set {
+            key: b"apple".to_vec(),
+            value: b"red".to_vec(),
+        };
+        let fig_purple = Record::Set {
+            key: b"fig".to_vec(),
+            value: b"purple".to_vec(),
+        };
+        let no_apple = Record::Delete {
+            key: b"apple".to_vec(),
+        };
+        let mut expected = apple_red.encode().unwrap();
+        expected.extend(fig_purple.encode().unwrap());
+        expected.extend(no_apple.encode().unwrap());
+        assert_eq!(log, expected);
+        // The apple record is 9 + 1 + 5 + 3 = 18 bytes, so fig starts at 18.
+        assert_eq!(store.index.get(b"fig".as_slice()), Some(&18));
+        assert_eq!(store.index.get(b"apple".as_slice()), None);
+        // fig's record is 9 + 1 + 3 + 6 = 19 bytes, the delete 9 + 1 + 5.
+        assert_eq!(store.end, 18 + 19 + 15);
         fs::remove_dir_all(&dir).unwrap();
     }
 }

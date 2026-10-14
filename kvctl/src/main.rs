@@ -4,7 +4,7 @@ use std::{
     process::ExitCode,
 };
 
-use kvkit::Store;
+use kvkit::{Result, Store};
 
 const USAGE: &str = "usage: kvctl --dir DIR <command>
 
@@ -26,7 +26,7 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(args: &[String]) -> io::Result<ExitCode> {
+fn run(args: &[String]) -> Result<ExitCode> {
     let [flag, dir, command, rest @ ..] = args else {
         return Ok(usage());
     };
