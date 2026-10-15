@@ -43,27 +43,27 @@ pub fn minimize<T: Clone>(input: &[T], mut fails: impl FnMut(&[T]) -> Option<usi
 
 // Explanation
 // CODE READABILITY FINAL BOSS !!!!!!!!!!
-// 
+//
 // Setup: input `[a b c d e f g h]`
 // The test fails as soon it has seen both `c` and `f`
 // and returns `Some(position just after that point)`
-// 
+//
 // STEP 0 - Confirm the failure, cut the tail
 // ------------------------------------------
 // input    [a b c d e f g h]
 // fails -> Some(6)         (both `c` and `f` seen by item `6`)
 // current  [a b c d e f]   (`g` and `h` are dropped)
 // chunk  = 6/2 = 3
-// 
+//
 // STEP 1 - pass with chunk = 3
 // ----------------------------
 // current      [a b c | d e f];  start = 0, end = 0 + 3 = 3, cut [0..3]
-// candidate    [d e f]        => None (no `c`) 
+// candidate    [d e f]        => None (no `c`)
 //                             -> start = 3, end = 3 + 3 = 6, cut [3..6]
 // candidate    [a b c]        => None (no `f`)
 //                             -> start = 6, end of pass
 // nothing removed -> chunk = 3/2 = 1
-// 
+//
 // STEP 2 - pass with chunk = 1
 // ----------------------------
 // [a b c d e f]    cut `a` -> [b c d e f]  Some(5) ✔ keep, start = 0
@@ -74,14 +74,14 @@ pub fn minimize<T: Clone>(input: &[T], mut fails: impl FnMut(&[T]) -> Option<usi
 // [c f]            cut `f` -> [c]          None✘ (no `f`), start = 2
 //                                                          end of pass
 // something removed -> chunk stays 1, run another pass
-// 
+//
 // STEP 3 - pass wwith chunk = 1 (check that nothing else can go)
 // --------------------------------------------------------------
 // [c f]    cut `c` -> [f]  None ✘
 // [c f]    cut `f` -> [c]  None ✘
-// 
+//
 // nmothing removed -> chunk = 1/2 = 0 -> STOP
-// 
+//
 // RESULT
 // ------
 // [c f]    removing either item makes the test PASS (1-minimal)
@@ -113,3 +113,64 @@ pub fn minimize<T: Clone>(input: &[T], mut fails: impl FnMut(&[T]) -> Option<usi
 //                             │ chunk == 0
 //                             ▼
 //                          return
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fails when a 3 comes somewhere before a 7, and says how far it read.
+    fn three_then_seven(items: &[u32]) -> Option<usize> {
+        let three = items.iter().position(|&x| x == 3)?;
+        let seven = items[three..].iter().position(|&x| x == 7)?;
+        Some(three + seven + 1)
+    }
+
+    #[test]
+    fn it_finds_the_two_items_that_matter() {
+        let input: Vec<u32> = (0..1000).map(|i| i % 10).collect();
+        assert_eq!(minimize(&input, three_then_seven), [3, 7]);
+    }
+
+    #[test]
+    fn the_result_still_fails_and_is_one_minimal() {
+        // Fails when the sum of the first items reaches 100, which leaves
+        // many different answers. Check the promise, not one answer.
+        let fails = |items: &[u32]| {
+            let mut sum = 0;
+            for (i, x) in items.iter().enumerate() {
+                sum += x;
+                if sum >= 100 {
+                    return Some(i + 1);
+                }
+            }
+            None
+        };
+        let input: Vec<u32> = (0..500).map(|i| (i * 7919) % 31).collect();
+        let small = minimize(&input, fails);
+        assert!(fails(&small).is_some());
+        for i in 0..small.len() {
+            let mut without = small.clone();
+            without.remove(i);
+            assert_eq!(fails(&without), None, "{small:?} without item {i}");
+        }
+    }
+
+    #[test]
+    fn it_counts_its_runs() {
+        // A dozen runs to find one item among 1,000, not 1,000.
+        let input: Vec<u32> = (0..1000).collect();
+        let mut runs = 0;
+        let small = minimize(&input, |items| {
+            runs += 1;
+            items.iter().position(|&x| x == 500).map(|i| i + 1)
+        });
+        assert_eq!(small, [500]);
+        assert!(runs < 40, "{runs} runs");
+    }
+
+    #[test]
+    #[should_panic(expected = "the input passed")]
+    fn an_input_that_passes_is_a_mistake() {
+        minimize(&[1, 2, 3], |_| None);
+    }
+}
