@@ -3,6 +3,7 @@
 pub mod checksum;
 pub mod codec;
 mod error;
+pub mod experiments;
 mod record;
 mod store;
 pub mod testkit;
