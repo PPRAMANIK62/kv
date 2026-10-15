@@ -4,13 +4,17 @@
 use std::{
     collections::BTreeMap,
     env, fmt, fs,
+    ops::Range,
     path::{Path, PathBuf},
     process,
 };
 
 use crate::{
     Result, Store,
-    testkit::ops::{Op, bstr},
+    testkit::{
+        minimize::minimize,
+        ops::{Op, OpGen, bstr},
+    },
 };
 
 pub trait Engine: Sized {
@@ -162,6 +166,38 @@ pub fn scratch_dir(name: &str) -> PathBuf {
     env::temp_dir().join(format!("kvkit-{}-{name}", process::id()))
 }
 
+/// Runs `steps` random operations from `generator` for each seed in
+/// `seeds`, or only for seed `$KVKIT_SEED` if that is set. On the first
+/// failure, minimizes it and panics with a report.
+pub fn model_test<E: Engine>(name: &str, generator: &OpGen, seeds: Range<u64>, steps: usize) {
+    let seeds = match env::var("KVKIT_SEED") {
+        Ok(seed) => {
+            let seed: u64 = seed.parse().expect("KVKIT_SEED must be a number");
+            seed..seed + 1
+        }
+        Err(_) => seeds,
+    };
+    let dir = scratch_dir(name);
+    for seed in seeds {
+        let ops = generator.ops(seed, steps);
+        let Err(failure) = check::<E>(&dir, &ops) else {
+            continue;
+        };
+        let small = minimize(&ops, |ops| check::<E>(&dir, ops).err().map(|f| f.step));
+        // Run it once more, to report it and leave its files in `dir`.
+        let small_failure = check::<E>(&dir, &small).expect_err("minimized ops must fail");
+        let mut report = format!("seed {seed}: {failure}\n\n");
+        report += &format!("minimized from {} to {} steps:\n", ops.len(), small.len());
+        for op in &small {
+            report += &format!("    {op},\n");
+        }
+        report += &format!("\n{small_failure}\n");
+        report += &format!("rerun with KVKIT_SEED={seed}; files in {}", dir.display());
+        panic!("{report}");
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -215,5 +251,17 @@ mod tests {
         assert_eq!(failure.what, "contents");
         assert_eq!(failure.expected, r#"{b"": b"", b"a": b"x"}"#);
         assert_eq!(failure.actual, "{}");
+    }
+}
+
+#[cfg(test)]
+mod model_test_tests {
+    use super::tests::Forgetful;
+    use super::*;
+
+    #[test]
+    #[should_panic(expected = "minimized from 200 to 2 steps")]
+    fn model_test_minimizes_what_it_finds() {
+        model_test::<Forgetful>("model_minimizes", &OpGen::default(), 0..1, 200);
     }
 }
