@@ -3,7 +3,7 @@
 
 /// The polynomial 0x1EDC6F41 with its bits reversed,
 /// for a CRC that processes the low bit of each byte first.
-const POLY: u32 = 0x82f6_3B78;
+const POLY: u32 = 0x82f6_3b78;
 
 /// `TABLES[0][b]` is the remainder of dividing the byte `b` by the polynomial.
 /// `TABLES[k][b]` is the same for `b` followed by `k` zero bytes.
