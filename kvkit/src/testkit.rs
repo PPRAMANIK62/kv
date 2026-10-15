@@ -6,3 +6,8 @@ mod minimize;
 mod model;
 mod ops;
 mod rng;
+
+pub use minimize::minimize;
+pub use model::{Engine, Failure, check, model_test, scratch_dir};
+pub use ops::{Op, OpGen};
+pub use rng::{Rng, splitmix64};
