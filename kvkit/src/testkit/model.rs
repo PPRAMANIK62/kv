@@ -1,7 +1,12 @@
 //! The model test: run operations against a store and against a map,
 //! and compare after every step.
 
-use std::{collections::BTreeMap, fmt, fs, path::Path};
+use std::{
+    collections::BTreeMap,
+    env, fmt, fs,
+    path::{Path, PathBuf},
+    process,
+};
 
 use crate::{
     Result, Store,
@@ -150,6 +155,11 @@ pub fn check<E: Engine>(dir: &Path, ops: &[Op]) -> Result<(), Failure> {
         }
     }
     Ok(())
+}
+
+/// A fresh directory path for test `name`, under the system's temp dir.
+pub fn scratch_dir(name: &str) -> PathBuf {
+    env::temp_dir().join(format!("kvkit-{}-{name}", process::id()))
 }
 
 #[cfg(test)]

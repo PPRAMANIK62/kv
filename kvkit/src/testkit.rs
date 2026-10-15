@@ -2,4 +2,7 @@
 //! sequences, a model test that compares a store with a map, and a
 //! minimizer that shrinks a failing sequence.
 
+mod minimize;
+mod model;
+mod ops;
 mod rng;
