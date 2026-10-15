@@ -27,7 +27,12 @@ impl Store {
     /// Opens the store in directory `dir`, creating the directory and
     /// an empty log if the don't exist, and rebuilds the index from the log.
     pub fn open(dir: impl AsRef<Path>) -> Result<Store> {
-        let dir = dir.as_ref();
+        Store::open_with(dir.as_ref(), replay)
+    }
+
+    /// Like `open`, but rebuilds the index with `replay`, so experiments
+    /// can plant a bug in it.
+    pub(crate) fn open_with(dir: &Path, replay: Replay) -> Result<Store> {
         fs::create_dir_all(dir)?;
         let mut file = OpenOptions::new()
             .read(true)
@@ -100,6 +105,9 @@ impl Store {
         Ok(pairs)
     }
 }
+
+/// Reads a log `end` bytes long and returns the index it describes.
+pub(crate) type Replay = fn(&mut File, u64) -> Result<HashMap<Vec<u8>, u64>>;
 
 /// Reads the whole log from the start and returns the index it describes,
 /// along with the log's length.
